@@ -1,0 +1,247 @@
+---
+title: "GDC data processing for CK - June 13th, 2019"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r message=FALSE}
+library(dplyr)
+library(reshape2)
+library(biomaRt)
+library(GenomicDataCommons)
+
+```
+
+```{r}
+#get gene IDs
+human = useMart("ensembl", dataset = "hsapiens_gene_ensembl") 
+#I sometimes get an Internal Server Error here
+#if it happens just try re-running this line.
+gene_ids = getBM(mart = human, 
+                 attributes = c(
+                   "ensembl_gene_id", "description", "hgnc_id", "hgnc_symbol"))
+
+#make a manifest
+ck_manifest = files() %>% 
+  GenomicDataCommons::filter( ~ cases.project.project_id == 'TCGA-CHOL' & 
+                                analysis.workflow_type == 'HTSeq - Counts') %>% 
+  manifest()
+
+#get the sample_type associated with each file in the manifest
+#this is important information that is not pulled down with the rest of the metadata
+ck_manifest_response = files() %>% 
+  GenomicDataCommons::filter( ~ cases.project.project_id == 'TCGA-CHOL' & 
+                                analysis.workflow_type == 'HTSeq - Counts') %>% 
+  select(c(default_fields(files()), 'cases.samples.sample_type')) %>% 
+  response_all()
+ck_manifest_sample_type <- ck_manifest_response$results %>% 
+  dplyr::select('cases', 'file_id') %>% 
+  rename('cases' = 'Sample_type')
+
+```
+
+```{r}
+#download the files, which creates a cache 
+#for me this is in /Users/jwalla12/Library/Caches/GenomicDataCommons
+#could skip this step if you don't want to download the counts
+#uncomment out the next line to download the counts files...
+#fnames = gdcdata(ck_manifest$id,progress=FALSE)
+```
+
+```{r message=FALSE}
+#get the rnaseq experiment results..
+tcga_se = gdc_rnaseq('TCGA-CHOL', 'HTSeq - Counts')
+
+#get the metadata
+tcga_metadata <- colData(tcga_se)
+
+#attach the additional sample_type info to metadata
+#first, make them into data.frames
+ck_manifest_sample_type_df = as.data.frame(ck_manifest_sample_type)
+tcga_metadata_df = as.data.frame(tcga_metadata)
+
+
+#perform the joins and clean up the results
+tcga_metadata_sample <- dplyr::inner_join(
+  tcga_metadata_df, ck_manifest_sample_type_df, by='file_id')
+
+tcga_metadata_sample_df <- apply(tcga_metadata_sample,2,as.character)
+
+tcga_metadata_sample_df = as.data.frame(tcga_metadata_sample_df)
+
+tcga_metadata_sample_df_cleaned <- tcga_metadata_sample_df %>% 
+  dplyr::mutate(Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ', 
+                                   '', 
+                                   Sample_type)) %>% 
+  dplyr::mutate(Sample_type = gsub(')))',
+                                   '', 
+                                   Sample_type)) %>% 
+  dplyr::mutate(Sample_type = gsub('\"', 
+                                   '', 
+                                   Sample_type))
+
+```
+
+```{r message=FALSE}
+#get the counts data
+tcga_counts <- assays(tcga_se)$exprs
+```
+
+```{r}
+#get the number of rows in the manifest file:
+manifest_rows <- nrow(ck_manifest)
+counts <- matrix(tcga_counts, ncol=manifest_rows) 
+#ncol is based on rows in the manifest file.
+dimnames(counts) <- dimnames(tcga_counts)
+counts_df <- as.data.frame(as.table(counts))
+#spread the df so it isn't in wide format
+counts_spread <- spread(counts_df, Var2, Freq) 
+```
+
+```{r}
+#calculate reads per million
+counts_spread_norm <- counts_spread %>%
+  gather(Column, Value, -Var1) %>%
+  group_by(Column) %>%
+  mutate(Value = Value/(sum(Value)/1000000)) %>%
+  spread(Column, Value)
+```
+
+```{r message=FALSE}
+
+#add gene ID info to the counts files
+#first, split the Var1 column in counts_spread and counts_spread_norm
+counts_spread_norm <- separate(
+  counts_spread_norm, Var1, into=c(
+    'ensembl_gene_id', 'ensembl_gene_id_version'), 
+  remove=FALSE, 
+  extra='warn', 
+  fill='warn')
+
+counts_spread <- separate(
+  counts_spread, Var1, into=c(
+    'ensembl_gene_id', 'ensembl_gene_id_version'), 
+  remove=FALSE, 
+  extra='warn', 
+  fill='warn')
+
+
+
+#then perform the joins and fix the column names...
+counts_spread_norm_ids <- dplyr::right_join(
+  gene_ids, 
+  counts_spread_norm, 
+  by='ensembl_gene_id') %>% 
+  rename('Var1' = 'gene')
+
+counts_spread_ids <- dplyr::right_join(
+  gene_ids, 
+  counts_spread, 
+  by='ensembl_gene_id') %>% 
+  rename('Var1' = 'gene')
+
+```
+
+```{r message=FALSE}
+#counts_spread_norm_ids is the normalized gene counts
+#counts_spread_ids is the raw gene counts
+#tcga_metadata_sample_df_cleaned is the dataframe of metadata with Sample_type
+
+#get normalized counts for GAPDH and ACTB 
+gapdh_norm_counts <- counts_spread_norm_ids %>% 
+  dplyr::filter(hgnc_symbol == 'GAPDH')
+
+actb_norm_counts <- counts_spread_norm_ids %>% 
+  dplyr::filter(hgnc_symbol == 'ACTB')
+
+#melt them..
+gapdh_norm_counts_m <- melt(gapdh_norm_counts) %>% 
+  rename('variable' = 'file_id', 'value' = 'counts_per_million')
+actb_norm_counts_m <- melt(actb_norm_counts) %>% 
+  rename('variable' = 'file_id', 'value' = 'counts_per_million')
+
+#merge w metadata...
+gapdh_norm_counts_meta <- dplyr::right_join(
+  tcga_metadata_sample_df_cleaned, 
+  gapdh_norm_counts_m, 
+  by = 'file_id') %>% 
+  dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts_per_million')
+
+actb_norm_counts_meta <- dplyr::right_join(
+  tcga_metadata_sample_df_cleaned, 
+  actb_norm_counts_m, 
+  by = 'file_id') %>% 
+  dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts_per_million')
+```
+
+```{r message=FALSE}
+#group by sample_type and plot the median and SD of normalized counts
+gapdh_norm_counts_meta_summary <- gapdh_norm_counts_meta %>% 
+  dplyr::group_by(Sample_type) %>% 
+  dplyr::summarize(
+    mean=mean(counts_per_million), 
+    sd=sd(counts_per_million), 
+    count = n_distinct(counts_per_million)) 
+actb_norm_counts_meta_summary <- actb_norm_counts_meta %>% 
+  dplyr::group_by(Sample_type) %>% 
+  dplyr::summarize(
+    mean=mean(counts_per_million), 
+    sd=sd(counts_per_million), 
+    count = n_distinct(counts_per_million))
+
+#set count results as factors
+gapdh_norm_counts_meta_summary$count <- as.factor(gapdh_norm_counts_meta_summary$count)
+actb_norm_counts_meta_summary$count <- as.factor(actb_norm_counts_meta_summary$count)
+
+```
+
+```{r}
+gapdh_plot <- ggplot(gapdh_norm_counts_meta_summary, aes(
+  x = count, 
+  y = mean, 
+  fill=Sample_type, 
+  label = gapdh_norm_counts_meta_summary$count)) + 
+  geom_bar(stat='identity') + 
+  geom_errorbar(aes(
+    ymin = mean-sd, 
+    ymax = mean+sd), 
+    width = .2) 
+
+gapdh_plot+labs(x='Number of samples per sample type', 
+                y='Counts per million - GAPDH') + 
+  theme_classic()
+
+#uncomment the following line to save the plot
+#ggsave(file = 'gapdh_plot.pdf')
+```
+
+
+
+```{r}
+actb_plot <- ggplot(actb_norm_counts_meta_summary, aes(
+  x = count, 
+  y = mean, 
+  fill=Sample_type, 
+  label = gapdh_norm_counts_meta_summary$count)) + 
+  geom_bar(stat='identity') + 
+  geom_errorbar(aes(
+    ymin = mean-sd, 
+    ymax = mean+sd), 
+    width = .2) 
+
+actb_plot+labs(x='Number of samples per sample type', 
+               y='Counts per million - ACTB') + 
+  theme_classic()
+
+#uncomment the following line to save the plot
+#ggsave(file = 'actb_plot.pdf')
+
+```
+
+
+```{r}
+sessionInfo()
+```
