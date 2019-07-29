@@ -14,74 +14,73 @@ library(biomaRt)
 library(SummarizedExperiment)
 library(GenomicDataCommons)
 library(openxlsx)
-
 ```
 
 #look at the gene_id output from BioMart and make sure the symbol and IDs map correctly and map 1:1, turn everything into functions and confirm, etc.
 
 
 ```{r}
+
+#set some variables
+project_id = 'TCGA-BRCA'
+gene_id = 'GAPDH'
+
+#li
+
+#https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-019-2809-2
+#suggests using HNRNPL, PCBP1, and RER1
+
+#https://www.frontiersin.org/articles/10.3389/fgene.2019.00097/full#h6
+#suggests using PUM1 and IPO8 as most stable across tissue types
+
+```
+
+```{r}
+
 #get gene IDs
 human = useMart("ensembl", dataset = "hsapiens_gene_ensembl") 
-```
-
-```{r}
 #listAttributes(human)
-```
-
-```{r}
 gene_ids = getBM(mart = human, 
                  attributes = c(
                    "ensembl_gene_id", "description", "hgnc_id", "hgnc_symbol"))
+```
 
+```{r message=FALSE}
 #make a manifest
 ck_manifest = files() %>% 
-  GenomicDataCommons::filter( ~ cases.project.project_id == 'TCGA-CHOL' & 
+  GenomicDataCommons::filter( ~ cases.project.project_id == project_id & 
                                 analysis.workflow_type == 'HTSeq - Counts') %>% 
   manifest()
-
 #get the sample_type associated with each file in the manifest
 #this is important information that is not pulled down with the rest of the metadata
 ck_manifest_response = files() %>% 
-  GenomicDataCommons::filter( ~ cases.project.project_id == 'TCGA-CHOL' & 
+  GenomicDataCommons::filter( ~ cases.project.project_id == project_id  & 
                                 analysis.workflow_type == 'HTSeq - Counts') %>% 
   select(c(default_fields(files()), 'cases.samples.sample_type')) %>% 
   response_all()
-
 ck_manifest_sample_type <- ck_manifest_response$results %>% 
   dplyr::select('cases', 'file_id', 'file_name') %>% 
   rename('cases' = 'Sample_type')
 
-```
-
-```{r}
 #download the files, which creates a cache 
 #for me this is in /Users/jwalla12/Library/Caches/GenomicDataCommons
 #could skip this step if you don't want to download the counts
 #uncomment out the next line to download the counts files...
 #fnames = gdcdata(ck_manifest$id,progress=FALSE)
-```
 
-```{r message=FALSE}
 #get the rnaseq experiment results..
-tcga_se = gdc_rnaseq('TCGA-CHOL', 'HTSeq - Counts')
-
+tcga_se = gdc_rnaseq(project_id, 'HTSeq - Counts')
 #get the metadata
 tcga_metadata <- colData(tcga_se)
-
 #attach the additional sample_type info to metadata
 #first, make them into data.frames
 ck_manifest_sample_type_df = as.data.frame(ck_manifest_sample_type)
 tcga_metadata_df = as.data.frame(tcga_metadata)
-
 #perform the joins and clean up the results
 tcga_metadata_sample <- dplyr::inner_join(
   tcga_metadata_df, ck_manifest_sample_type_df, by='file_id')
-
 tcga_metadata_sample_df <- apply(tcga_metadata_sample,2,as.character)
-
 tcga_metadata_sample_df = as.data.frame(tcga_metadata_sample_df)
-
 tcga_metadata_sample_df_cleaned <- tcga_metadata_sample_df %>% 
   dplyr::mutate(Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ', 
                                    '', 
@@ -93,33 +92,22 @@ tcga_metadata_sample_df_cleaned <- tcga_metadata_sample_df %>%
                                    '', 
                                    Sample_type))
 
-```
-
-```{r message=FALSE}
 #get the counts data
 tcga_counts_unfiltered <- assays(tcga_se)$exprs
-
 #remove rows (genes) where the counts are all 0
 tcga_counts_df <- as.data.frame(tcga_counts_unfiltered)
-
 tcga_counts <- tcga_counts_df %>% 
   rownames_to_column('gene') %>%
   mutate(total=rowSums(select_if(., is.numeric))) %>%
   dplyr::filter(total != 0) %>%
   dplyr::select(-total)
-```
 
-```{r}
 #calculate reads per million
 counts_spread_norm <- tcga_counts %>%
   gather(Column, Value, -gene) %>%
   group_by(Column) %>%
   mutate(Value = Value/(sum(Value)/1000000)) %>%
   spread(Column, Value)
-
-```
-
-```{r message=FALSE}
 
 #add gene ID info to the counts files
 #first, split the gene column in counts_spread and counts_spread_norm
@@ -137,115 +125,61 @@ counts_spread <- separate(
   extra='warn', 
   fill='warn')
 
-```
-
-```{r}
 #then perform the joins...
 counts_spread_norm_ids <- dplyr::right_join(
   gene_ids, 
   counts_spread_norm, 
   by='ensembl_gene_id') 
-
 counts_spread_ids <- dplyr::right_join(
   gene_ids, 
   counts_spread, 
   by='ensembl_gene_id') 
 
-```
-
-
-###still need to remove rows that sum to 0
-
-
-
-```{r message=FALSE}
 #counts_spread_norm_ids is the normalized gene counts
 #counts_spread_ids is the raw gene counts
 #tcga_metadata_sample_df_cleaned is the dataframe of metadata with Sample_type
-
 #get raw & normalized counts for GAPDH and ACTB 
-gapdh_norm_counts <- counts_spread_norm_ids %>% 
-  dplyr::filter(hgnc_symbol == 'GAPDH')
+norm_counts <- counts_spread_norm_ids %>% 
+  dplyr::filter(hgnc_symbol == gene_id)
 
-actb_norm_counts <- counts_spread_norm_ids %>% 
-  dplyr::filter(hgnc_symbol == 'ACTB')
-
-
-gapdh_counts <- counts_spread_ids %>% 
-  dplyr::filter(hgnc_symbol == 'GAPDH')
-
-actb_counts <- counts_spread_ids %>% 
-  dplyr::filter(hgnc_symbol == 'ACTB')
-
+raw_counts <- counts_spread_ids %>% 
+  dplyr::filter(hgnc_symbol == gene_id)
 
 #melt them..
-gapdh_norm_counts_m <- melt(gapdh_norm_counts) %>% 
-  rename('variable' = 'file_id', 'value' = 'counts_per_million')
-actb_norm_counts_m <- melt(actb_norm_counts) %>% 
+norm_counts_m <- melt(norm_counts) %>% 
   rename('variable' = 'file_id', 'value' = 'counts_per_million')
 
-gapdh_counts_m <- melt(gapdh_counts) %>% 
-  rename('variable' = 'file_id', 'value' = 'counts')
-actb_counts_m <- melt(actb_counts) %>% 
+raw_counts_m <- melt(raw_counts) %>% 
   rename('variable' = 'file_id', 'value' = 'counts')
 
 #merge w metadata...
-gapdh_norm_counts_meta <- dplyr::right_join(
+norm_counts_meta <- dplyr::right_join(
   tcga_metadata_sample_df_cleaned, 
-  gapdh_norm_counts_m, 
+  norm_counts_m, 
   by = 'file_id') %>% 
   dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts_per_million')
 
-actb_norm_counts_meta <- dplyr::right_join(
+raw_counts_meta <- dplyr::right_join(
   tcga_metadata_sample_df_cleaned, 
-  actb_norm_counts_m, 
-  by = 'file_id') %>% 
-  dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts_per_million')
-
-
-
-gapdh_counts_meta <- dplyr::right_join(
-  tcga_metadata_sample_df_cleaned, 
-  gapdh_counts_m, 
+  raw_counts_m, 
   by = 'file_id') %>% 
   dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts')
 
-actb_counts_meta <- dplyr::right_join(
-  tcga_metadata_sample_df_cleaned, 
-  actb_counts_m, 
-  by = 'file_id') %>% 
-  dplyr::select('case_id', 'file_id', 'Sample_type', 'hgnc_symbol', 'counts')
-
-
+#filter counts so only 'Primary Tumor' and 'Solid Tissue Normal' are in 'Sample_type'
+norm_counts_meta_filt <- dplyr::filter(norm_counts_meta, Sample_type == 'Solid Tissue Normal' | Sample_type == 'Primary Tumor')
+raw_counts_meta_filt <- dplyr::filter(raw_counts_meta, Sample_type == 'Solid Tissue Normal' | Sample_type == 'Primary Tumor')
 
 ```
 
 ```{r}
 #make plots of individuals from raw data
+raw_counts_meta_individ <- ggplot(raw_counts_meta_filt, aes(x = file_id, y = counts, fill = Sample_type)) + geom_bar(stat='identity')
 
-gapdh_counts_meta_individ <- ggplot(gapdh_counts_meta, aes(x = file_id, y = counts, fill = Sample_type)) + geom_bar(stat='identity')
-
-gapdh_counts_meta_individ + 
-  labs(y='Counts - GAPDH') + 
+raw_counts_meta_individ + 
+  labs(y=paste0('Counts - ', gene_id)) + 
   theme_classic() + 
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-ggsave(file = 'gapdgh_fileid_plot.pdf')
-```
-
-```{r}
-#make plots of individuals from raw data
-
-actb_counts_meta_individ <- ggplot(actb_counts_meta, aes(x = file_id, y = counts, fill = Sample_type)) + geom_bar(stat='identity')
-
-actb_counts_meta_individ + 
-  labs(y='Counts - ACTB') + 
-  theme_classic() + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-ggsave(file = 'actb_fileid_plot.pdf')
-
-
+ggsave(file = paste0(gene_id, '_', project_id, '_counts_plot.pdf'))
 ```
 
 ```{r message=FALSE}
@@ -267,13 +201,10 @@ ggsave(file = 'actb_fileid_plot.pdf')
 # #set count results as factors
 # gapdh_norm_counts_meta_summary$count <- as.factor(gapdh_norm_counts_meta_summary$count)
 # actb_norm_counts_meta_summary$count <- as.factor(actb_norm_counts_meta_summary$count)
-
 ```
 
 ```{r}
-
 #Normalized summary plot
-
 # gapdh_plot <- ggplot(gapdh_norm_counts_meta_summary, aes(
 #   x = count, 
 #   y = mean, 
@@ -288,9 +219,6 @@ ggsave(file = 'actb_fileid_plot.pdf')
 # gapdh_plot+labs(x='Number of samples per sample type', 
 #                 y='Counts per million - GAPDH') + 
 #   theme_classic()
-
-
-
 #uncomment the following line to save the plot
 #ggsave(file = 'gapdh_plot.pdf')
 ```
@@ -298,10 +226,7 @@ ggsave(file = 'actb_fileid_plot.pdf')
 
 
 ```{r}
-
 #Normalized summary plot
-
-
 # actb_plot <- ggplot(actb_norm_counts_meta_summary, aes(
 #   x = count, 
 #   y = mean, 
@@ -316,10 +241,8 @@ ggsave(file = 'actb_fileid_plot.pdf')
 # actb_plot+labs(x='Number of samples per sample type', 
 #                y='Counts per million - ACTB') + 
 #   theme_classic()
-
 #uncomment the following line to save the plot
 #ggsave(file = 'actb_plot.pdf')
-
 ```
 
 ```{r}
@@ -331,9 +254,7 @@ ggsave(file = 'actb_fileid_plot.pdf')
 
 ```{r}
 #make rownames into a named column
-
 #tcga_metadata_sample_df_cleaned 
-
 #tcga_metadata_rowname_df <- rownames_to_column(tcga_metadata_sample_df_cleaned, var = "rowname")
 ```
 
@@ -378,10 +299,8 @@ tcga_metadata_sample_df_cleaned_subset <- tcga_metadata_sample_df_cleaned %>%
 ```{r}
 #transpose the dataframe
 tcga_metadata_transposed <- as.data.frame(t(tcga_metadata_sample_df_cleaned_subset))
-
 #add colnames
 colnames(tcga_metadata_transposed) <- as.character(unlist(tcga_metadata_transposed[2,]))
-
 #make the rownames into a column
 tcga_metadata_transposed_rownames <- rownames_to_column(tcga_metadata_transposed, 'metadata')
 ```
@@ -398,7 +317,6 @@ tcga_metadata_transposed_spaced <- add_column(
   hgnc_symbol = NA, 
   gene = NA, 
   ensembl_gene_id_version = NA)
-
 counts_spread_norm_ids_ord_spaced <- add_column(
   counts_spread_norm_ids, 
   metadata = NA) 
@@ -421,11 +339,9 @@ column_order <- c(gene_id_order, sample_order)
 counts_norm_sorted  <- counts_spread_norm_ids_ord_spaced %>% dplyr::select(c(column_order))
 counts_sorted  <- counts_spread_ids_ord_spaced %>% dplyr::select(c(column_order))
 tcga_metadata_sorted <- tcga_metadata_transposed_spaced %>% dplyr::select(c(column_order))
-
 ```
 
 ```{r}
-
 #convert factors to characters...
 counts_sorted %>% 
   mutate_if(is.factor, as.character) -> counts_sorted_f
@@ -452,21 +368,16 @@ line_9 <- ""
 line_10 <- "The 'raw_clinical' tab is the raw read counts from each htseq file"
 line_11 <- "The 'normalized_clinical' tab is the raw counts normalized by library size -- that is to say (the number of reads mapped to each gene for a given file_id)/(millions of reads mapped across all genes for a given file_id)"
 line_12 <- ""
-
 #bind additional headers
 column_explanations <- rbind(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7, line_8, line_9, line_10, line_11, line_12)
 #write.table(column_explanations, '~/column_expl.txt', sep='\t')
-
 #turn to df
 column_explanations_df = as.data.frame(column_explanations)
-
 #add extra dummy columns based on column_order
 column_explanations_df[c(column_order)] <- NA
-
 #convert factors to characters...
 #column_explanations_df %>% 
 #  mutate_if(is.factor, as.character) -> column_explanations_f
-
 #drop metadata column and rename V1 as metadata.
 column_explanations_f <- dplyr::select(column_explanations_df, -c(metadata)) %>% rename('V1' = 'metadata')
 ```
@@ -479,21 +390,15 @@ norm_counts_headers <- rbind(tcga_metadata_sorted_f, column_explanations_f, coun
 
 ```{r}
 #turn NA to blanks
-
 raw_counts_headers[is.na(raw_counts_headers)] <- " "
 norm_counts_headers[is.na(norm_counts_headers)] <- " "
-
 ```
 
 
 ```{r}
 #try writing to file...
-
 write.table(raw_counts_headers, '~/raw_counts_headers.txt', sep='\t', row.names=F)
 write.table(norm_counts_headers, '~/norm_counts_headers.txt', sep='\t', row.names=F)
-
-
-
 ```
 
 
@@ -503,8 +408,6 @@ write.table(norm_counts_headers, '~/norm_counts_headers.txt', sep='\t', row.name
 #write.xlsx(raw_counts_headers, file='~/ck_data_new.xlsx', colNames=TRUE)
 sheet_list <- list('NormalizedCounts' = norm_counts_headers, 'RawCounts' = raw_counts_headers)
 write.xlsx(sheet_list, file = '~/ck_data_new.xlsx')
-
-
 #add some info explaining the columns
 #compile into an excel sheet
 ```
