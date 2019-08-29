@@ -10,268 +10,274 @@ library(reshape2)
 library(biomaRt)
 library(SummarizedExperiment)
 library(GenomicDataCommons)
-library(openxlsx)
+```
 
-manifest_create <- function(project_id){
-  manifest_file = files() %>%
-    GenomicDataCommons::filter( ~ cases.project.project_id == project_id &
-                                  analysis.workflow_type == 'HTSeq - Counts') %>%
-    manifest()
-  return(manifest_file)
-}
-
-get_sample_meta <- function(project_id, manifest){
-  manifest_response = files() %>%
-    GenomicDataCommons::filter( ~ cases.project.project_id == project_id  &
-                                  analysis.workflow_type == 'HTSeq - Counts') %>%
-    select(c(default_fields(files()), 'cases.samples.sample_type')) %>%
-    response_all()
-
-  sample_type <- manifest_response$results %>%
-    dplyr::select('cases', 'file_id', 'file_name') %>%
+```{r message=FALSE, warning=FALSE}
+get_tcga_metadata <- function(project_id){
+  
+  manifest = files() %>% 
+    GenomicDataCommons::filter(
+      ~ cases.project.project_id == project_id & 
+      analysis.workflow_type == 'HTSeq - Counts') %>% 
+  manifest()
+  
+  manifest_response = files() %>% 
+    GenomicDataCommons::filter(
+      ~ cases.project.project_id == project_id & 
+      analysis.workflow_type == 'HTSeq - Counts') %>% 
+    select(c(
+      default_fields(files()), 
+      'cases.samples.sample_type')) %>% 
+  response_all()
+  
+  manifest_sample_type <- manifest_response$results %>% 
+    dplyr::select('cases', 
+                  'file_id', 
+                  'file_name') %>% 
     rename('cases' = 'Sample_type')
+  
+  
+  tcga_metadata = colData(gdc_rnaseq(project_id, 'HTSeq - Counts')) #get the rnaseq metadata..
 
-  sample_type <- as.data.frame(sample_type)
+  manifest_sample_type_df = as.data.frame(manifest_sample_type, stringsAsFactors=FALSE)
+  tcga_metadata_df = as.data.frame(tcga_metadata, stringsAsFactors=FALSE)
 
-  tcga_se = gdc_rnaseq(project_id, 'HTSeq - Counts')
-  tcga_metadata <- colData(tcga_se)
-  tcga_metadata <- as.data.frame(tcga_metadata)
+#perform the joins and clean up the results
+  tcga_metadata_sample <- dplyr::inner_join(tcga_metadata_df, manifest_sample_type_df, by='file_id')
+  #tcga_metadata_sample_df <- as.data.frame(apply(tcga_metadata_sample,2,as.character))
+  tcga_metadata_sample_df_cleaned <- tcga_metadata_sample %>% 
+    dplyr::mutate(
+      Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ', 
+                         '',
+                         Sample_type)) %>% 
+    dplyr::mutate(
+      Sample_type = gsub(')))',
+                         '',
+                         Sample_type)) %>% 
+    dplyr::mutate(
+      Sample_type = gsub('\"',
+                         '',
+                         Sample_type))
+  
+  tcga_metadata_sample_df_cleaned_filt <- dplyr::filter(tcga_metadata_sample_df_cleaned, Sample_type == 'Solid Tissue Normal' | Sample_type == 'Primary Tumor') 
+  
+  return(tcga_metadata_sample_df_cleaned_filt)}
 
-  meta_sample <- dplyr::inner_join(tcga_metadata, sample_type, by='file_id')
-  meta_sample <- apply(meta_sample,2,as.character)
-  meta_sample <- as.data.frame(meta_sample)
-  meta_sample <- meta_sample %>%
-    dplyr::mutate(Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ',
-                                     '',
-                                     Sample_type)) %>%
-    dplyr::mutate(Sample_type = gsub(')))',
-                                     '',
-                                     Sample_type)) %>%
-    dplyr::mutate(Sample_type = gsub('\"',
-                                     '',
-                                     Sample_type))
-  return(meta_sample)
-}
-get_sample_meta <- function(project_id){
-  manifest_response = files() %>%
-    GenomicDataCommons::filter( ~ cases.project.project_id == project_id  &
-                                  analysis.workflow_type == 'HTSeq - Counts') %>%
-    select(c(default_fields(files()), 'cases.samples.sample_type')) %>%
-    response_all()
+get_gene_ids <- function(mart, data){
+  gene_ids = getBM(mart = (useMart(mart, dataset = data)),
+                   attributes = c(
+                     "ensembl_gene_id", 
+                     "description", 
+                     "hgnc_id", 
+                     "hgnc_symbol"))
+  return(gene_ids)}
 
-  sample_type <- manifest_response$results %>%
-    dplyr::select('cases', 'file_id', 'file_name') %>%
-    rename('cases' = 'Sample_type')
-
-  sample_type <- as.data.frame(sample_type)
-
-  tcga_se = gdc_rnaseq(project_id, 'HTSeq - Counts')
-  tcga_metadata <- colData(tcga_se)
-  tcga_metadata <- as.data.frame(tcga_metadata)
-
-  meta_sample <- dplyr::inner_join(tcga_metadata, sample_type, by='file_id')
-  meta_sample <- apply(meta_sample,2,as.character)
-  meta_sample <- as.data.frame(meta_sample)
-  meta_sample <- meta_sample %>%
-    dplyr::mutate(Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ',
-                                     '',
-                                     Sample_type)) %>%
-    dplyr::mutate(Sample_type = gsub(')))',
-                                     '',
-                                     Sample_type)) %>%
-    dplyr::mutate(Sample_type = gsub('\"',
-                                     '',
-                                     Sample_type))
-  return(meta_sample)
-}
-
-get_raw_counts <- function(project_id){
-  tcga_rnaseq = as.data.frame(
-    assays(
-      gdc_rnaseq(
-        project_id, 'HTSeq - Counts'))$exprs) %>%
+#get raw and normalized counts
+get_raw_counts <- function(project_id, gene_ids){
+  tcga_counts_df <- as.data.frame((assays(gdc_rnaseq(project_id, 'HTSeq - Counts'))$exprs), stringsAsFactors=FALSE) #get the counts data
+  
+  tcga_counts <- tcga_counts_df %>% 
     rownames_to_column('gene') %>%
     mutate(total=rowSums(select_if(., is.numeric))) %>%
     dplyr::filter(total != 0) %>%
-    dplyr::select(-total)
-  tcga_rnaseq = as.data.frame(tcga_rnaseq)
-  return(tcga_rnaseq)
+    dplyr::select(-total) #removes genes where all counts are 0
+  
+  tcga_counts_sep <- separate(
+    tcga_counts, gene, into=c(
+      'ensembl_gene_id', 'ensembl_gene_id_version'), 
+    remove=FALSE, 
+    extra='warn', 
+    fill='warn') #remove version info from gene_id
+  
+  tcga_counts_sep_ids <- dplyr::right_join(
+  gene_ids, 
+  tcga_counts_sep, 
+  by='ensembl_gene_id') #add the additional gene information based on gene_id
+  
+  tcga_counts_ids_df <- as.data.frame(tcga_counts_sep_ids, stringsAsFactors=FALSE) %>% 
+    melt() %>% 
+    rename('variable' = 'file_id', 'value' = 'counts')
+  
 }
 
-get_norm_counts <- function(project_id){
-  tcga_rnaseq = as.data.frame(
-    assays(
-      gdc_rnaseq(
-        project_id, 'HTSeq - Counts'))$exprs) %>%
+get_norm_counts <- function(project_id, gene_ids){
+  tcga_counts_df <- as.data.frame((assays(gdc_rnaseq(project_id, 'HTSeq - Counts'))$exprs), stringsAsFactors=FALSE) #get the counts data
+  
+  tcga_counts <- tcga_counts_df %>% 
     rownames_to_column('gene') %>%
     mutate(total=rowSums(select_if(., is.numeric))) %>%
     dplyr::filter(total != 0) %>%
-    dplyr::select(-total)
-  tcga_rnaseq = as.data.frame(tcga_rnaseq)
-  normalized <- tcga_rnaseq %>%
+    dplyr::select(-total) #removes genes where all counts are 0
+  
+  tcga_norm_counts <- tcga_counts %>%
     gather(Column, Value, -gene) %>%
     group_by(Column) %>%
     mutate(Value = Value/(sum(Value)/1000000)) %>%
-    spread(Column, Value)
-  return(normalized)
-}
-
-add_ids_to_counts <- function(counts){
-
-  #get human ensembl mart
-  human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")  #could do listAttributes(human)
-
-  #get gene IDs
-  gene_ids = getBM(mart = human,
-                   attributes = c(
-                     "ensembl_gene_id", "description", "hgnc_id", "hgnc_symbol"))
-
-  counts_spread <- separate(
-    counts,
-    gene,
-    into=c(
-      'ensembl_gene_id',
-      'ensembl_gene_id_version'),
-    remove=FALSE,
-    extra='warn',
-    fill='warn')
-
-  counts_and_ids <- dplyr::right_join(
-    gene_ids,
-    counts_spread,
-    by='ensembl_gene_id')
-
-  #melt the df..
-
-  counts_and_ids_melted <- melt(counts_and_ids) %>%
+    spread(Column, Value) #normalizes counts based on total reads mapped in the file
+  
+  tcga_norm_counts_sep <- separate(
+    tcga_norm_counts, gene, into=c(
+      'ensembl_gene_id', 'ensembl_gene_id_version'), 
+    remove=FALSE, 
+    extra='warn', 
+    fill='warn') #remove version info from gene_id
+  
+  tcga_norm_counts_ids <- dplyr::right_join(
+  gene_ids, 
+  tcga_norm_counts_sep, 
+  by='ensembl_gene_id')
+  
+  tcga_counts_norm_ids_df <- as.data.frame(tcga_norm_counts_ids, stringsAsFactors=FALSE) %>% 
+    melt() %>% 
     rename('variable' = 'file_id', 'value' = 'counts')
-  return(counts_and_ids_melted)
+
+  return(tcga_counts_norm_ids_df)
 }
 
-add_file_metadata <- function(melted_counts, samplemeta){
-  file_metadata <- dplyr::inner_join(melted_counts, samplemeta)
-  return(file_metadata)
+#add metadata to counts tables
+add_counts_metadata <- function(counts, samplemeta){
+  counts_melted <- melt(counts) %>%
+    rename('variable' = 'file_id', 'value' = 'counts')
+  counts_metadata <- inner_join(samplemeta, counts)
+  return(counts_metadata)
 }
 
-filter_counts <- function(counts_metadata_table, gene_symbol){
-  gene_counts <- counts_metadata_table %>%
-    dplyr::filter(hgnc_symbol == gene_symbol)
-  return(gene_counts)
+get_gene_expr <- function(counts, genes_of_interest){
+  gene_expr <- dplyr::filter(counts, hgnc_symbol == genes_of_interest) 
+  return(gene_expr)
 }
+```
 
-filter_sample_type <- function(counts_metadata_table){
-  counts_metadata_table_filt <- dplyr::filter(
-    counts_metadata_table,
-    Sample_type == 'Solid Tissue Normal' |
-    Sample_type == 'Primary Tumor')
-  return(counts_metadata_table_filt)
-}
-
-   
-# create_plot <- function(counts_filt, normalization_type, project_id, gene_of_interest){
-#   plot1 <- ggplot(
-#     counts_filt, aes(
-#       x = file_id,
-#       y = counts,
-#       fill = Sample_type)) +
-#     geom_bar(stat='identity') +
-#     theme_classic() +
-#     labs(x=(paste0(project_id)), y=(paste0(normalization_type,' - ', gene_of_interest))) +
-#     theme(axis.text.x = element_blank())
-#   return(plot1)
-# }
-
-create_plot <- function(counts_filt, normalization_type, project_id, gene_of_interest){
-  print(ggplot(
-    counts_filt, aes(
+```{r}
+#create a plot
+create_expr_plot <- function(counts_df, normtype, project_id){
+  plot <- ggplot(
+    counts_df, 
+    aes(
       x = file_id,
       y = counts,
       fill = Sample_type)) +
-      geom_bar(stat='identity') +
-      theme_classic() +
-      labs(x=(paste0(project_id)), 
-           y=(paste0(normalization_type,' - ', gene_of_interest))) +
-    theme(axis.text.x = element_blank()))
+    geom_bar(stat='identity') +
+    theme_classic() +
+    labs(x=paste0(project_id), y=paste0(counts_df$hgnc_symbol, ' - ', normtype)) +
+    theme(axis.text.x = element_blank())
+  return(plot)
 }
 ```
 
-```{r message=FALSE, warning=FALSE}
-project_id_list = c('TCGA-CHOL', 'TCGA-KICH', 'TCGA-ESCA', 'TCGA-READ')
-```
+###################
 
-```{r message=FALSE, warning=FALSE}
-ck_manifest_list <- lapply(project_id_list, manifest_create)
-names(ck_manifest_list) <- project_id_list
+#see https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/tcga-study-abbreviations
 
-ck_samplemeta_list <- lapply(project_id_list, get_sample_meta)
-names(ck_samplemeta_list) <- project_id_list
-
-ck_raw_counts_list <- lapply(project_id_list, get_raw_counts)
-names(ck_raw_counts_list) <- project_id_list
-
-ck_norm_counts_list <- lapply(project_id_list, get_norm_counts)
-names(ck_norm_counts_list) <- project_id_list
-
-ck_raw_counts_list_ids <- lapply(ck_raw_counts_list, add_ids_to_counts)
-names(ck_raw_counts_list_ids) <- names(ck_raw_counts_list)
-ck_norm_counts_list_ids <- lapply(ck_norm_counts_list, add_ids_to_counts)
-names(ck_norm_counts_list_ids) <- names(ck_norm_counts_list)
-
-ck_raw_counts_id_meta_list <- mapply(add_file_metadata, ck_raw_counts_list_ids, ck_samplemeta_list)
-ck_norm_counts_id_meta_list <- mapply(add_file_metadata, ck_norm_counts_list_ids, ck_samplemeta_list)
-
-ck_raw_counts_id_meta_list_filt <- lapply(ck_raw_counts_id_meta_list, filter_sample_type)
-ck_norm_counts_id_meta_list_filt <- lapply(ck_norm_counts_id_meta_list, filter_sample_type)
-
-#filter counts and plot for each individual gene...
-
-###################################################
 #for the genes selected:
 #https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-019-2809-2
 #suggests using HNRNPL, PCBP1, and RER1
 
 #https://www.frontiersin.org/articles/10.3389/fgene.2019.00097/full#h6
 #suggests using RPN1, PUM1 and IPO8
+
+###################
+
+projects: 'TCGA-CHOL', 'TCGA-KICH', 'TCGA-ESCA', 'TCGA-READ'
+
+###################
+
+```{r message=FALSE, warning=FALSE}
+gene_id_table <- get_gene_ids('ensembl', 'hsapiens_gene_ensembl')
+list_of_genes <- c('GAPDH', 'ACTB', 'HNRNPL', 'PCBP1', 'RER1', 'RPN1', 'PUM1', 'IPO8')
 ```
 
 ```{r message=FALSE, warning=FALSE}
-gene = 'GAPDH'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+project <- 'TCGA-CHOL'
+metadata <- get_tcga_metadata(project)
+
+norm_counts <- get_norm_counts(project,  gene_ids = gene_id_table)
+norm_counts_meta <- add_counts_metadata(norm_counts, metadata)
+norm_results <- lapply(list_of_genes, get_gene_expr, counts = norm_counts_meta)
+names(norm_results) <- list_of_genes
+CHOL_plots_norm <- lapply(norm_results, create_expr_plot, normtype = 'normalized', project_id = project)
+
+raw_counts <- get_raw_counts(project,  gene_ids = gene_id_table)
+raw_counts_meta <- add_counts_metadata(raw_counts, metadata)
+raw_results <- lapply(list_of_genes, get_gene_expr, counts = raw_counts_meta)
+names(raw_results) <- list_of_genes
+CHOL_plots_raw <- lapply(raw_results, create_expr_plot, normtype = 'raw', project_id = project)
 ```
+
 ```{r message=FALSE, warning=FALSE}
-gene = 'ACTB'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+project <- 'TCGA-KICH'
+metadata <- get_tcga_metadata(project)
+norm_counts <- get_norm_counts(project,  gene_ids = gene_id_table)
+norm_counts_meta <- add_counts_metadata(norm_counts, metadata)
+norm_results <- lapply(list_of_genes, get_gene_expr, counts = norm_counts_meta)
+names(norm_results) <- list_of_genes
+KICH_plots_norm <- lapply(norm_results, create_expr_plot, normtype = 'normalized', project_id = project)
+
+raw_counts <- get_raw_counts(project,  gene_ids = gene_id_table)
+raw_counts_meta <- add_counts_metadata(raw_counts, metadata)
+raw_results <- lapply(list_of_genes, get_gene_expr, counts = raw_counts_meta)
+names(raw_results) <- list_of_genes
+KICH_plots_raw <- lapply(raw_results, create_expr_plot, normtype = 'raw', project_id = project)
+
 ```
+
 ```{r message=FALSE, warning=FALSE}
-gene = 'HNRNPL'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+project <- 'TCGA-ESCA'
+metadata <- get_tcga_metadata(project)
+norm_counts <- get_norm_counts(project,  gene_ids = gene_id_table)
+norm_counts_meta <- add_counts_metadata(norm_counts, metadata)
+norm_results <- lapply(list_of_genes, get_gene_expr, counts = norm_counts_meta)
+names(norm_results) <- list_of_genes
+ESCA_plots_norm <- lapply(norm_results, create_expr_plot, normtype = 'normalized', project_id = project)
+
+raw_counts <- get_raw_counts(project,  gene_ids = gene_id_table)
+raw_counts_meta <- add_counts_metadata(raw_counts, metadata)
+raw_results <- lapply(list_of_genes, get_gene_expr, counts = raw_counts_meta)
+names(raw_results) <- list_of_genes
+ESCA_plots_raw <- lapply(raw_results, create_expr_plot, normtype = 'raw', project_id = project)
+
+
 ```
+
 ```{r message=FALSE, warning=FALSE}
-gene = 'PCBP1'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+project <- 'TCGA-READ'
+metadata <- get_tcga_metadata(project)
+norm_counts <- get_norm_counts(project,  gene_ids = gene_id_table)
+norm_counts_meta <- add_counts_metadata(norm_counts, metadata)
+norm_results <- lapply(list_of_genes, get_gene_expr, counts = norm_counts_meta)
+names(norm_results) <- list_of_genes
+READ_plots_norm <- lapply(norm_results, create_expr_plot, normtype = 'normalized', project_id = project)
+
+raw_counts <- get_raw_counts(project,  gene_ids = gene_id_table)
+raw_counts_meta <- add_counts_metadata(raw_counts, metadata)
+raw_results <- lapply(list_of_genes, get_gene_expr, counts = raw_counts_meta)
+names(raw_results) <- list_of_genes
+READ_plots_raw <- lapply(raw_results, create_expr_plot, normtype = 'raw', project_id = project)
+
 ```
-```{r message=FALSE, warning=FALSE}
-gene = 'RER1'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+
+```{r}
+CHOL_plots_norm
+CHOL_plots_raw
 ```
-```{r message=FALSE, warning=FALSE}
-gene = 'RPN1'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+```{r}
+KICH_plots_norm
+KICH_plots_raw
+
 ```
-```{r message=FALSE, warning=FALSE}
-gene = 'PUM1'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+```{r}
+ESCA_plots_norm
+ESCA_plots_raw
+
 ```
-```{r message=FALSE, warning=FALSE}
-gene = 'IPO8'
-ck_norm_counts_id_meta_list_filt_gene <- lapply(ck_norm_counts_id_meta_list_filt, filter_counts, gene_symbol = gene)
-ck_norm_counts_id_meta_list_filt_gene_plots <- mapply(create_plot, counts_filt = ck_norm_counts_id_meta_list_filt_gene, normalization_type = 'normalized', project_id = project_id_list, gene_of_interest = gene)
+```{r}
+READ_plots_norm
+READ_plots_raw
+
+```
+
+
+```{r}
+sessionInfo()
 ```
 
