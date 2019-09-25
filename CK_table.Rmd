@@ -1,0 +1,326 @@
+---
+title: "CK_table"
+author: "Joselynn"
+date: "8/29/2019"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(reshape2)
+library(purrr)
+library(biomaRt)
+library(SummarizedExperiment)
+library(GenomicDataCommons)
+library(openxlsx)
+```
+#Querying TCGA data for qPCR housekeeping genes, as well as suggested RNAseq housekeeping genes from two publications.
+
+```{r message=FALSE, warning=FALSE}
+get_tcga_metadata <- function(project_id){
+  
+  manifest = files() %>% 
+    GenomicDataCommons::filter(
+      ~ cases.project.project_id == project_id & 
+      analysis.workflow_type == 'HTSeq - Counts') %>% 
+  manifest()
+  
+  manifest_response = files() %>% 
+    GenomicDataCommons::filter(
+      ~ cases.project.project_id == project_id & 
+      analysis.workflow_type == 'HTSeq - Counts') %>% 
+    select(c(
+      default_fields(files()), 
+      'cases.samples.sample_type')) %>% 
+  response_all()
+  
+  manifest_sample_type <- manifest_response$results %>% 
+    dplyr::select('cases', 
+                  'file_id', 
+                  'file_name') %>% 
+    rename('cases' = 'Sample_type')
+  
+  #get the rnaseq metadata..
+  tcga_metadata = colData(gdc_rnaseq(project_id, 'HTSeq - Counts')) 
+
+  manifest_sample_type_df = as.data.frame(
+    manifest_sample_type, 
+    stringsAsFactors=FALSE)
+  tcga_metadata_df = as.data.frame(
+    tcga_metadata, 
+    stringsAsFactors=FALSE)
+
+#perform the joins and clean up the results
+  tcga_metadata_sample <- 
+    dplyr::inner_join(
+      tcga_metadata_df, 
+      manifest_sample_type_df, 
+      by='file_id')
+
+  tcga_metadata_sample_df_cleaned <- 
+    tcga_metadata_sample %>% 
+    dplyr::mutate(
+      Sample_type = gsub('list\\(samples = list\\(list\\(sample_type \\= ', 
+                         '',
+                         Sample_type)) %>% 
+    dplyr::mutate(
+      Sample_type = gsub(')))',
+                         '',
+                         Sample_type)) %>% 
+    dplyr::mutate(
+      Sample_type = gsub('\"',
+                         '',
+                         Sample_type))
+  
+  tcga_metadata_sample_df_cleaned_filt <- dplyr::filter(
+    tcga_metadata_sample_df_cleaned, 
+    Sample_type == 'Solid Tissue Normal' | Sample_type == 'Primary Tumor') 
+  
+  return(tcga_metadata_sample_df_cleaned_filt)}
+
+get_gene_ids <- function(mart, data){
+  gene_ids = getBM(mart = (useMart(mart, dataset = data)),
+                   attributes = c(
+                     "ensembl_gene_id", 
+                     "description", 
+                     "hgnc_id", 
+                     "hgnc_symbol"))
+  return(gene_ids)}
+
+#get raw and normalized counts
+get_raw_counts <- function(project_id, gene_ids){
+  tcga_counts_df <- as.data.frame((
+    assays(
+      gdc_rnaseq(
+        project_id, 'HTSeq - Counts'))$exprs), 
+    stringsAsFactors=FALSE) #get the counts data
+  
+  tcga_counts <- tcga_counts_df %>% 
+    rownames_to_column('gene') %>%
+    mutate(total=rowSums(select_if(., is.numeric))) %>%
+    dplyr::filter(total != 0) %>%
+    dplyr::select(-total) #removes genes where all counts are 0
+  
+  tcga_counts_sep <- separate(
+    tcga_counts, gene, into=c(
+      'ensembl_gene_id', 'ensembl_gene_id_version'), 
+    remove=FALSE, 
+    extra='warn', 
+    fill='warn') #remove version info from gene_id
+  
+  tcga_counts_sep_ids <- dplyr::right_join(
+  gene_ids, 
+  tcga_counts_sep, 
+  by='ensembl_gene_id') #add the additional gene information based on gene_id
+  
+  tcga_counts_ids_df <- as.data.frame(
+    tcga_counts_sep_ids, 
+    stringsAsFactors=FALSE) %>% 
+    melt() %>% 
+    rename('variable' = 'file_id', 'value' = 'counts')
+  
+}
+
+get_norm_counts <- function(project_id, gene_ids){
+  tcga_counts_df <- as.data.frame((
+    assays(
+      gdc_rnaseq(
+        project_id, 'HTSeq - Counts'))$exprs), 
+    stringsAsFactors=FALSE) #get the counts data
+  
+  tcga_counts <- tcga_counts_df %>% 
+    rownames_to_column('gene') %>%
+    mutate(total=rowSums(select_if(., is.numeric))) %>%
+    dplyr::filter(total != 0) %>%
+    dplyr::select(-total) #removes genes where all counts are 0
+  
+  tcga_norm_counts <- tcga_counts %>%
+    gather(Column, Value, -gene) %>%
+    group_by(Column) %>%
+    mutate(Value = Value/(sum(Value)/1000000)) %>%
+    spread(Column, Value) #normalizes counts based on total reads mapped in the file
+  
+  tcga_norm_counts_sep <- separate(
+    tcga_norm_counts, gene, into=c(
+      'ensembl_gene_id', 'ensembl_gene_id_version'), 
+    remove=FALSE, 
+    extra='warn', 
+    fill='warn') #remove version info from gene_id
+  
+  tcga_norm_counts_ids <- dplyr::right_join(
+  gene_ids, 
+  tcga_norm_counts_sep, 
+  by='ensembl_gene_id')
+  
+  tcga_counts_norm_ids_df <- as.data.frame(
+    tcga_norm_counts_ids, 
+    stringsAsFactors=FALSE) %>% 
+    melt() %>% 
+    rename('variable' = 'file_id', 'value' = 'counts')
+
+  return(tcga_counts_norm_ids_df)
+}
+
+#add metadata to counts tables
+add_counts_metadata <- function(counts, samplemeta){
+  counts_melted <- melt(counts) %>%
+    rename('variable' = 'file_id', 'value' = 'counts')
+  counts_metadata <- inner_join(samplemeta, counts)
+  return(counts_metadata)
+}
+
+#filter metadata
+filter_metadata <- function(metadata_table){
+  metadata_out <- dplyr::select(metadata_table, case_id , file_id , file_name ,gender , race , ethnicity , weight , height , bmi , vital_status , age_at_index , days_to_birth , days_to_death , year_of_birth , year_of_death , year_of_diagnosis , age_at_diagnosis , primary_diagnosis , disease_type , primary_site , submitter_id.diagnoses , tumor_stage , morphology , tissue_or_organ_of_origin , prior_malignancy , synchronous_malignancy , site_of_resection_or_biopsy , days_to_last_follow_up , cigarettes_per_day , years_smoked , alcohol_history , alcohol_intensity , Sample_type)
+  return(metadata_out)
+
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+gene_id_table <- get_gene_ids('ensembl', 'hsapiens_gene_ensembl')
+
+project <- 'TCGA-CHOL'
+metadata_unfilt <- get_tcga_metadata(project)
+metadata <- filter_metadata(metadata_unfilt)
+```
+
+```{r message=FALSE, warning=FALSE}
+norm_counts <- get_norm_counts(project,  gene_ids = gene_id_table)
+raw_counts <- get_raw_counts(project,  gene_ids = gene_id_table)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+#transpose the metadata dataframe
+metadata_transposed <- as.data.frame(t(metadata))
+#add colnames
+colnames(metadata_transposed) <- as.character(unlist(metadata_transposed[2,]))
+#make the rownames into a column
+metadata_transposed_rownames <- rownames_to_column(metadata_transposed, 'metadata')
+```
+
+```{r message=FALSE, warning=FALSE}
+#add some empty columns to the metadata and counts dataframes -- this will mean they all have the same columns (but in different orders)
+metadata_transposed_rownames_spaced <- add_column(
+  metadata_transposed_rownames, 
+  ensembl_gene_id = NA, 
+  description = NA, 
+  hgnc_id = NA, 
+  hgnc_symbol = NA, 
+  gene = NA, 
+  ensembl_gene_id_version = NA)
+
+norm_counts_spaced <- norm_counts %>% 
+  spread(key = file_id, value = counts) %>%
+  add_column(metadata = NA)
+
+raw_counts_spaced <- raw_counts %>% 
+  spread(key = file_id, value = counts) %>%
+  add_column(metadata = NA)
+
+```
+
+
+```{r message=FALSE, warning=FALSE}
+#re-order so columns are in the same order in all dfs...
+#column_order <- c((colnames(norm_counts_spaced)[1:6]), (colnames(norm_counts_spaced)[52]),(colnames(norm_counts_spaced)[7:51]))
+
+column_order <- c((colnames(metadata_transposed_rownames_spaced)[47:52]), (colnames(metadata_transposed_rownames_spaced)[1]), (colnames(metadata_transposed_rownames_spaced)[2:46]))
+
+norm_counts_ordered  <- norm_counts_spaced %>% dplyr::select(c(column_order))
+raw_counts_ordered <- raw_counts_spaced %>% dplyr::select(c(column_order))
+metadata_sorted <- metadata_transposed_rownames_spaced %>% dplyr::select(c(column_order))
+
+```
+
+```{r}
+#convert factors to characters...
+norm_counts_ordered %>% 
+  mutate_if(is.factor, as.character) -> norm_counts_ordered
+raw_counts_ordered %>% 
+  mutate_if(is.factor, as.character) -> raw_counts_ordered
+metadata_sorted  %>% 
+  mutate_if(is.factor, as.character) -> metadata_sorted
+```
+
+```{r}
+#create some additional headers..
+line_0 <- ""
+line_1 <- "metadata: indicates which type of metadata is associated with each htseq-counts file."
+line_2 <- "gene: Ensembl gene ID with version information, which are also the gene identifiers used in the HTseq-Counts files from TCGA -- note that some of these gene IDs have been deprecated or retired, so they do not have a current HGNC or ensembl ID in subsequent columns."
+line_3 <- "ensembl_gene_id: Ensembl gene ID without version information"
+line_4 <- "ensembl_gene_id_version: Ensembl gene ID - version information only"
+line_5 <- "description: Ensembl gene description"
+line_6 <- "hgnc_id: HUGO Gene Nomenclature Committee (HGNC) gene ID"
+line_7 <- "hgnc_symbol: HUGO Gene Nomenclature Committee (HGNC) gene symbol"
+line_8 <- "The remaining columns indicate the 'file_id' associated with each set of gene counts"
+line_9 <- ""
+line_10 <- "The 'raw_clinical' tab is the raw read counts from each htseq file"
+line_11 <- "The 'normalized_clinical' tab is the raw counts normalized by library size -- that is to say (the number of reads mapped to each gene for a given file_id)/(millions of reads mapped across all genes for a given file_id)"
+line_12 <- ""
+
+#bind additional headers
+column_explanations <- rbind(line_0, line_1, line_2, line_3, line_4, line_5, line_6, line_7, line_8, line_9, line_10, line_11, line_12)
+#write.table(column_explanations, '~/column_expl.txt', sep='\t')
+#turn to df
+column_explanations = as.data.frame(column_explanations)
+#add extra dummy columns based on column_order
+column_explanations[c(column_order)] <- NA
+#convert factors to characters...
+#column_explanations_df %>% 
+#  mutate_if(is.factor, as.character) -> column_explanations_f
+#drop metadata column and rename V1 as metadata.
+column_explanations <- dplyr::select(column_explanations, -c(metadata)) %>% rename('V1' = 'metadata')
+```
+
+```{r}
+#bind the new rows as headers on the counts and metadata
+norm_counts_headers <- rbind(metadata_sorted, column_explanations, (colnames(metadata_sorted)), norm_counts_ordered)
+raw_counts_headers <- rbind(metadata_sorted, column_explanations, (colnames(metadata_sorted)), raw_counts_ordered)
+```
+
+```{r}
+#turn NA to blanks
+raw_counts_headers[is.na(raw_counts_headers)] <- ""
+norm_counts_headers[is.na(norm_counts_headers)] <- ""
+```
+
+
+```{r message=FALSE}
+#write to an excel sheet
+#write.xlsx(raw_counts_headers, file='~/ck_data_new.xlsx', colNames=TRUE)
+
+workbook <- createWorkbook('ck_data')
+
+addWorksheet(workbook, 'NormalizedCounts')
+writeData(workbook, sheet = 1, norm_counts_headers)
+deleteData(workbook, sheet = 1, cols = 8:52, rows = 36:46, gridExpand = TRUE)
+
+addWorksheet(workbook, 'RawCounts')
+writeData(workbook, sheet = 2, raw_counts_headers)
+deleteData(workbook, sheet = 2, cols = 8:52, rows = 36:46, gridExpand = TRUE)
+
+saveWorkbook(workbook, file = '~/ck_data_new_formatted_.xlsx')
+
+```
+
+sheet_list <- list('NormalizedCounts' = norm_counts_headers, 'RawCounts' = raw_counts_headers)
+
+
+writeDataTable(workbook, 1, norm_counts_headers)
+addWorksheet(sheet_list[1], 'NormalizedCounts')
+addWorksheet(sheet_list[2], 'RawCounts')
+```
+sheet_1 <- sheet_list[1]
+sheet_1 <- deleteData(sheet_1, sheet = 'NormalizedCounts', cols = 8:52, rows = 36:46, gridExpand = TRUE)
+write.xlsx(sheet_list, file = '~/ck_data_new.xlsx')
+#add some info explaining the columns
+#compile into an excel sheet
+```
+    
+```{r}
+sessionInfo()
+```
